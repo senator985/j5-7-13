@@ -259,10 +259,10 @@ async function prepareRop(p) {
   return { p: runtime, chain };
 }
 
-async function main(userlandRW) {
+async function main(userlandRW, payloadName, secondaryPayload) {
   const { p, chain } = await prepareRop(userlandRW);
   const { runKernelExploit } = await import("./relapse_exploit.js");
-  const result = await runKernelExploit(p, chain, log);
+  const result = await runKernelExploit(p, chain, log, payloadName, secondaryPayload);
   if (!result || !result.done)
     throw new Error("kernel exploit did not finish");
 
